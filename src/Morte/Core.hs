@@ -1,11 +1,16 @@
-{-# LANGUAGE CPP                        #-}
-{-# LANGUAGE DeriveDataTypeable         #-}
-{-# LANGUAGE DeriveFoldable             #-}
-{-# LANGUAGE DeriveFunctor              #-}
-{-# LANGUAGE DeriveTraversable          #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE OverloadedStrings          #-}
-{-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE CPP                  #-}
+{-# LANGUAGE DeriveDataTypeable   #-}
+{-# LANGUAGE DeriveFoldable       #-}
+{-# LANGUAGE DeriveFunctor        #-}
+{-# LANGUAGE DeriveGeneric        #-}
+{-# LANGUAGE DeriveTraversable    #-}
+{-# LANGUAGE FlexibleContexts     #-}
+{-# LANGUAGE FlexibleInstances    #-}
+{-# LANGUAGE GADTs                #-}
+{-# LANGUAGE OverloadedStrings    #-}
+{-# LANGUAGE RankNTypes           #-}
+{-# LANGUAGE TemplateHaskell      #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -Wall #-}
 
 {-| This module contains the core calculus for the Morte language.  This
@@ -57,7 +62,7 @@ module Morte.Core (
 
     -- * Core functions
     typeWith,
-    typeOf,
+    typeWith,
     normalize,
 
     -- * Utilities
@@ -70,25 +75,38 @@ module Morte.Core (
     TypeMessage(..),
     ) where
 
+import           Bound                            (Scope (..), Var (..), (>>>=))
+import qualified Bound
+import           Bound.Name                       (Name (..), name)
 #if MIN_VERSION_base(4,8,0)
 #else
-import Control.Applicative (Applicative(..), (<$>))
+import           Control.Applicative              (Applicative (..), (<$>))
 #endif
-import Control.DeepSeq (NFData(..))
-import Control.Exception (Exception)
-import Control.Monad (mzero)
-import Data.Binary (Binary(..), Get, Put)
-import Data.Foldable
-import Data.Monoid ((<>))
-import Data.String (IsString(..))
-import Data.Text.Buildable (Buildable(..))
-import Data.Text.Lazy (Text)
-import Data.Traversable
-import Data.Typeable (Typeable)
-import Data.Word (Word8)
-import Filesystem.Path.CurrentOS (FilePath)
-import Morte.Context (Context)
-import Prelude hiding (FilePath)
+import           Control.DeepSeq                  (NFData (..))
+import           Control.Error.Util               (note)
+import           Control.Exception                (Exception)
+import           Control.Monad                    (ap, join, mzero)
+import           Data.Binary                      (Binary (..), Get, Put)
+import           Data.Coerce
+import           Data.Foldable
+import           Data.Maybe                       (isNothing)
+import           Data.Monoid                      ((<>))
+import           Data.String                      (IsString (..))
+import           Data.Text.Buildable              (Buildable (..))
+import           Data.Text.Lazy                   (Text)
+import           Data.Text.Lazy.Builder           (Builder)
+import           Data.Traversable
+import           Data.Typeable                    (Typeable)
+import           Data.Word                        (Word8)
+import           Filesystem.Path.CurrentOS        (FilePath)
+import           Prelude                          hiding (FilePath)
+#if MIN_VERSION_transformers(0,5,0) || !MIN_VERSION_transformers(0,4,0)
+import           Data.Deriving                    (deriveEq1, deriveOrd1,
+                                                   deriveRead1, deriveShow1)
+import           Data.Functor.Classes
+#else
+import           Prelude.Extras
+#endif
 
 import qualified Control.Monad.Trans.State.Strict as State
 import qualified Data.Binary.Get                  as Get
@@ -97,7 +115,7 @@ import qualified Data.Text.Encoding               as Text
 import qualified Data.Text.Lazy                   as Text
 import qualified Data.Text.Lazy.Builder           as Builder
 import qualified Filesystem.Path.CurrentOS        as Filesystem
-import qualified Morte.Context                    as Context
+import           GHC.Generics                     (Generic)
 
 {-| Label for a bound variable
 
@@ -131,7 +149,7 @@ import qualified Morte.Context                    as Context
     Zero indices are omitted when pretty-printing `Var`s and non-zero indices
     appear as a numeric suffix.
 -}
-data Var = V Text Int deriving (Eq, Show)
+-- data Var = V Text Int deriving (Eq, Show)
 
 putUtf8 :: Text -> Put
 putUtf8 txt = put (Text.encodeUtf8 (Text.toStrict txt))
@@ -142,22 +160,6 @@ getUtf8 = do
     case Text.decodeUtf8' bs of
         Left  e   -> fail (show e)
         Right txt -> return (Text.fromStrict txt)
-
-instance Binary Var where
-    put (V x n) = do
-        putUtf8 x
-        Put.putWord64le (fromIntegral n)
-    get = V <$> getUtf8 <*> fmap fromIntegral Get.getWord64le
-
-instance IsString Var
-  where
-    fromString str = V (Text.pack str) 0
-
-instance NFData Var where
-  rnf (V n p) = rnf n `seq` rnf p
-
-instance Buildable Var where
-    build (V txt n) = build txt <> if n == 0 then "" else ("@" <> build n)
 
 {-| Constants for the calculus of constructions
 
@@ -173,7 +175,7 @@ instance Buildable Var where
 > ⊦ □ ↝ □ : □
 
 -}
-data Const = Star | Box deriving (Eq, Show, Bounded, Enum)
+data Const = Star | Box deriving (Eq, Ord, Show, Read, Bounded, Enum)
 
 instance Binary Const where
     put c = case c of
@@ -196,7 +198,7 @@ instance Buildable Const where
 
 axiom :: Const -> Either TypeError Const
 axiom Star = return Box
-axiom Box  = Left (TypeError Context.empty (Const Box) (Untyped Box))
+axiom Box  = Left (Untyped Box)
 
 rule :: Const -> Const -> Either TypeError Const
 rule Star Box  = return Box
@@ -244,88 +246,56 @@ instance Binary X where
     put = absurd
 
 -- | Syntax tree for expressions
-data Expr a
+data Expr var
     -- | > Const c        ~  c
     = Const Const
     -- | > Var (V x 0)    ~  x
     --   > Var (V x n)    ~  x@n
-    | Var Var
+    | Var var
     -- | > Lam x     A b  ~  λ(x : A) → b
-    | Lam Text (Expr a) (Expr a)
+    | Lam (Name Text ()) (Type var) (Scope () Expr var)
     -- | > Pi x      A B  ~  ∀(x : A) → B
     --   > Pi unused A B  ~        A  → B
-    | Pi  Text (Expr a) (Expr a)
+    | Pi  (Name Text ()) (Type var) (Scope () Expr var)
     -- | > App f a        ~  f a
-    | App (Expr a) (Expr a)
-    -- | > Embed path     ~  #path
-    | Embed a
-    deriving (Functor, Foldable, Traversable, Show)
+    | App (Expr var) (Expr var)
+    deriving (Eq, Ord, Functor, Foldable, Traversable, Show, Read, Generic)
+
+type Type = Expr
+
+type ClosedExpr = Expr X
+
+-- higher-rank Eq*, Ord*, Show*, Read* are needed because of polymorphic
+-- recursion in @Scope@. The respective classes moved from transformers
+-- to Data.Functor.Classes, so beginning with transformers-0.5 we use them.
+-- Unfortunately, we can't derive the instances at the moment.
+-- Fortunately, there's deriving-compat.
+#if MIN_VERSION_transformers(0,5,0) || !MIN_VERSION_transformers(0,4,0)
+$(deriveEq1 ''Expr)
+$(deriveOrd1 ''Expr)
+$(deriveShow1 ''Expr)
+$(deriveRead1 ''Expr)
+#else
+instance Eq1 Expr
+instance Ord1 Expr
+instance Show1 Expr
+instance Read1 Expr
+#endif
 
 instance Applicative Expr where
-    pure = Embed
-
-    mf <*> mx = case mf of
-        Const c     -> Const c
-        Var   v     -> Var v
-        Lam x _A  b -> Lam x (_A <*> mx) ( b <*> mx)
-        Pi  x _A _B -> Pi  x (_A <*> mx) (_B <*> mx)
-        App f a     -> App (f <*> mx) (a <*> mx)
-        Embed f     -> fmap f mx
+    pure = Var
+    (<*>) = ap
 
 instance Monad Expr where
-    return = Embed
+    return = pure
+    Const c     >>= _ = Const c
+    Var x       >>= f = f x
+    Lam x _A  b >>= f = Lam x (_A >>= f) (b >>>= f)
+    Pi  x _A _B >>= f = Pi  x (_A >>= f) (_B >>>= f)
+    App g a     >>= f = App (g >>= f) (a >>= f)
 
-    m >>= k = case m of
-        Const c     -> Const c
-        Var   v     -> Var v
-        Lam x _A  b -> Lam x (_A >>= k) ( b >>= k)
-        Pi  x _A _B -> Pi  x (_A >>= k) (_B >>= k)
-        App f a     -> App (f >>= k) (a >>= k)
-        Embed r     -> k r
 
-match :: Text -> Int -> Text -> Int -> [(Text, Text)] -> Bool
-match xL nL xR nR  []                                      = xL == xR && nL == nR
-match xL 0  xR 0  ((xL', xR'):_ ) | xL == xL' && xR == xR' = True
-match xL nL xR nR ((xL', xR'):xs) = nL' `seq` nR' `seq` match xL nL' xR nR' xs
-  where
-    nL' = if xL == xL' then nL - 1 else nL
-    nR' = if xR == xR' then nR - 1 else nR
-
-instance Eq a => Eq (Expr a) where
-    eL0 == eR0 = State.evalState (go (normalize eL0) (normalize eR0)) []
-      where
---      go :: Expr a -> Expr a -> State [(Text, Text)] Bool
-        go (Const cL) (Const cR) = return (cL == cR)
-        go (Var (V xL nL)) (Var (V xR nR)) = do
-            ctx <- State.get
-            return (match xL nL xR nR ctx)
-        go (Lam xL tL bL) (Lam xR tR bR) = do
-            ctx <- State.get
-            eq1 <- go tL tR
-            if eq1
-                then do
-                    State.put ((xL, xR):ctx)
-                    eq2 <- go bL bR
-                    State.put ctx
-                    return eq2
-                else return False
-        go (Pi xL tL bL) (Pi xR tR bR) = do
-            ctx <- State.get
-            eq1 <- go tL tR
-            if eq1
-                then do
-                    State.put ((xL, xR):ctx)
-                    eq2 <- go bL bR
-                    State.put ctx
-                    return eq2
-                else return False
-        go (App fL aL) (App fR aR) = do
-            b1 <- go fL fR
-            if b1 then go aL aR else return False
-        go (Embed pL) (Embed pR) = return (pL == pR)
-        go _ _ = return False
-
-instance Binary a => Binary (Expr a) where
+instance Binary (Expr Text) where
     put e = case e of
         Const c     -> do
             put (0 :: Word8)
@@ -333,197 +303,149 @@ instance Binary a => Binary (Expr a) where
         Var x       -> do
             put (1 :: Word8)
             put x
-        Lam x _A b  -> do
+        Lam (Name x _) _A b  -> do
             put (2 :: Word8)
-            putUtf8 x
+            put x
             put _A
-            put b
-        Pi  x _A _B -> do
+            put (Bound.instantiate1 (pure x) b)
+        Pi  (Name x _) _A _B -> do
             put (3 :: Word8)
-            putUtf8 x
+            put x
             put _A
-            put _B
+            put (Bound.instantiate1 (pure x) _B)
         App f a     -> do
             put (4 :: Word8)
             put f
             put a
-        Embed p     -> do
-            put (5 :: Word8)
-            put p
 
     get = do
         n <- get :: Get Word8
         case n of
             0 -> Const <$> get
             1 -> Var <$> get
-            2 -> Lam <$> getUtf8 <*> get <*> get
-            3 -> Pi  <$> getUtf8 <*> get <*> get
+            2 -> do
+                x <- get
+                _A <- get
+                b <- Bound.abstract1 (name x) <$> get
+                return (Lam x _A b)
+            3 -> do
+                x <- get
+                _A <- get
+                _B <- Bound.abstract1 (name x) <$> get
+                return (Pi x _A _B)
             4 -> App <$> get <*> get
-            5 -> Embed <$> get
             _ -> fail "get Expr: Invalid tag byte"
 
-instance IsString (Expr a)
-  where
+instance IsString var => IsString (Expr var) where
     fromString str = Var (fromString str)
 
-instance NFData a => NFData (Expr a) where
+instance (NFData b, NFData a) => NFData (Var b a)
+instance (NFData b, NFData a) => NFData (Name b a)
+
+instance (NFData (f (Var b (f a))), NFData (f a)) => NFData (Scope b f a) where
+    rnf (Scope s) = rnf s
+
+instance NFData var => NFData (Expr var) where
     rnf e = case e of
         Const c     -> rnf c
         Var   v     -> rnf v
         Lam x _A b  -> rnf x `seq` rnf _A `seq` rnf b
         Pi  x _A _B -> rnf x `seq` rnf _A `seq` rnf _B
         App f a     -> rnf f `seq` rnf a
-        Embed p     -> rnf p
 
 -- | Generates a syntactically valid Morte program
-instance Buildable a => Buildable (Expr a)
+instance Buildable var => Buildable (Expr var)
   where
-    build = go False False
+    build = go False False . fmap build
       where
+        paren False s = s
+        paren True  s = "(" <> s <> ")"
+
+        go :: Bool -> Bool -> Expr Builder -> Builder
         go parenBind parenApp e = case e of
-            Const c    -> build c
-            Var x      -> build x
-            Lam x _A b ->
-                    (if parenBind then "(" else "")
-                <>  "λ("
+            Const c              -> build c
+            Var x                -> x
+            Lam (Name x _) _A b  -> paren parenBind $
+                    "λ("
                 <>  build x
                 <>  " : "
                 <>  go False False _A
                 <>  ") → "
-                <>  go False False b
-                <>  (if parenBind then ")" else "")
-            Pi  x _A b ->
-                    (if parenBind then "(" else "")
-                <>  (if x /= "_"
+                <>  go False False (Bound.instantiate1 (pure (build x)) b)
+            Pi  (Name x _) _A _B -> paren parenBind $
+                    (if x /= "_"
                      then "∀(" <> build x <> " : " <> go False False _A <> ")"
                      else go True False _A )
                 <>  " → "
-                <>  go False False b
-                <>  (if parenBind then ")" else "")
-            App f a    ->
-                    (if parenApp then "(" else "")
-                <>  go True False f <> " " <> go True True a
-                <>  (if parenApp then ")" else "")
-            Embed p    -> build p
+                <>  go False False (Bound.instantiate1 (pure (build x)) _B)
+            App f a              -> go True False f <> " " <> go True True a
 
 -- | The specific type error
-data TypeMessage
-    = UnboundVariable
-    | InvalidInputType (Expr X)
-    | InvalidOutputType (Expr X)
-    | NotAFunction
-    | TypeMismatch (Expr X) (Expr X)
+data TypeError
+    = UnboundVariable Builder
+    | InvalidInputType (Expr Builder) (Type Builder)
+    | InvalidOutputType (Expr Builder) (Type Builder)
+    | NotAFunction (Expr Builder) (Type Builder)
+    | TypeMismatch (Expr Builder) (Type Builder) (Type Builder)
     | Untyped Const
-    deriving (Show)
+    deriving (Show, Generic)
 
-instance NFData TypeMessage where
-    rnf tm = case tm of
-        UnboundVariable     -> ()
-        InvalidInputType e  -> rnf e
-        InvalidOutputType e -> rnf e
-        NotAFunction        -> ()
-        TypeMismatch e1 e2  -> rnf e1 `seq` rnf e2
-        Untyped c           -> rnf c
+instance NFData TypeError
 
-instance Buildable TypeMessage where
+instance Buildable TypeError where
     build msg = case msg of
-        UnboundVariable          ->
-                "Error: Unbound variable\n"
-        InvalidInputType expr    ->
+        UnboundVariable x        ->
+                "\n"
+            <>  "\n"
+            <>  "Error: Unbound variable\n"
+            <>  "Variable: " <> x <> "\n"
+        InvalidInputType expr ty  ->
                 "Error: Invalid input type\n"
             <>  "\n"
-            <>  "Type: " <> build expr <> "\n"
-        InvalidOutputType expr   ->
+            <>  buildExpr expr
+            <>  buildType ty
+        InvalidOutputType expr ty ->
                 "Error: Invalid output type\n"
             <>  "\n"
-            <>  "Type: " <> build expr <> "\n"
-        NotAFunction             ->
+            <>  buildExpr expr
+            <>  buildType ty
+        NotAFunction e f          ->
                 "Error: Only functions may be applied to values\n"
-        TypeMismatch expr1 expr2 ->
+            <>  "\n"
+            <>  buildExpr e
+            <>  buildType f
+        TypeMismatch e exp arg    ->
                 "Error: Function applied to argument of the wrong type\n"
             <>  "\n"
-            <>  "Expected type: " <> build expr1 <> "\n"
-            <>  "Argument type: " <> build expr2 <> "\n"
-        Untyped c                ->
+            <>  buildExpr e
+            <>  "Expected type: " <> build exp <> "\n"
+            <>  "Argument type: " <> build arg <> "\n"
+        Untyped c                 ->
                 "Error: " <> build c <> " has no type\n"
-
--- | A structured type error that includes context
-data TypeError = TypeError
-    { context     :: Context (Expr X)
-    , current     :: Expr X
-    , typeMessage :: TypeMessage
-    } deriving (Typeable)
-
-instance Show TypeError where
-    show = Text.unpack . pretty
+      where
+        buildExpr e = "Expression: " <> build e <> "\n"
+        buildType ty = "Type: " <> build ty <> "\n"
 
 instance Exception TypeError
 
-instance NFData TypeError where
-    rnf (TypeError ctx crr tym) = rnf ctx `seq` rnf crr `seq` rnf tym
+type CheckResult var = Either TypeError var
 
-instance Buildable TypeError where
-    build (TypeError ctx expr msg)
-        =   "\n"
-        <>  (    if Text.null (Builder.toLazyText (buildContext ctx))
-                 then ""
-                 else "Context:\n" <> buildContext ctx <> "\n"
-            )
-        <>  "Expression: " <> build expr <> "\n"
-        <>  "\n"
-        <>  build msg
-      where
-        buildKV (key, val) = build key <> " : " <> build val
+type Context var = var -> CheckResult (Type var)
 
-        buildContext =
-                build
-            .   Text.unlines
-            .   map (Builder.toLazyText . buildKV)
-            .   reverse
-            .   Context.toList
+consContext :: (Expr var) -> Context var -> Context (Var () var)
+consContext v ctx k = case k of
+    B () -> pure (F <$> v)
+    F k  -> (F <$>) <$> ctx k
 
-{-| Substitute all occurrences of a variable with an expression
+asConst :: Expr var -> Maybe Const
+asConst e = case e of
+    Const c -> Just c
+    _       -> Nothing
 
-> subst x n C B  ~  B[x@n := C]
--}
-subst :: Text -> Int -> Expr a -> Expr a -> Expr a
-subst x n e' e = case e of
-    Lam x' _A  b  -> Lam x' (subst x n e' _A)  b'
-      where
-        n'  = if x == x' then n + 1 else n
-        b'  = n' `seq` subst x n' (shift 1 x' e')  b
-    Pi  x' _A _B  -> Pi  x' (subst x n e' _A) _B'
-      where
-        n'  = if x == x' then n + 1 else n
-        _B' = n' `seq` subst x n' (shift 1 x' e') _B
-    App f a       -> App (subst x n e' f) (subst x n e' a)
-    Var (V x' n') -> if x == x' && n == n' then e' else e
-    Const k       -> Const k
-    -- The Morte compiler enforces that all embedded values
-    -- are closed expressions
-    Embed p       -> Embed p
-
-{-| @shift n x@ adds @n@ to the index of all free variables named @x@ within an
-    `Expr`
--}
-shift :: Int -> Text -> Expr a -> Expr a
-shift d x0 e0 = go e0 0
-  where
-    go e c = case e of
-        Lam x _A  b -> Lam x (go _A c) (go  b $! c')
-          where
-            c' = if x == x0 then c + 1 else c
-        Pi  x _A _B -> Pi  x (go _A c) (go _B $! c')
-          where
-            c' = if x == x0 then c + 1 else c
-        App f a     -> App (go f c) (go a c)
-        Var (V x n) -> n' `seq` Var (V x n')
-          where
-            n' = if x == x0 && n >= c then n + d else n
-        Const k     -> Const k
-        -- The Morte compiler enforces that all embedded values
-        -- are closed expressions
-        Embed p     -> Embed p
+asPi :: Expr var -> Maybe (Type var, Scope () Type var)
+asPi e = case e of
+    Pi _ _A _B -> Just (_A, _B)
+    _          -> Nothing
 
 {-| Type-check an expression and return the expression's type if type-checking
     suceeds or an error if type-checking fails
@@ -532,83 +454,62 @@ shift d x0 e0 = go e0 0
     is not necessary for just type-checking.  If you actually care about the
     returned type then you may want to `normalize` it afterwards.
 -}
-typeWith :: Context (Expr X) -> Expr X -> Either TypeError (Expr X)
+typeWith :: (Eq var, Buildable var) => Context var -> Expr var -> CheckResult (Type var)
 typeWith ctx e = case e of
     Const c     -> fmap Const (axiom c)
-    Var (V x n) -> case Context.lookup x n ctx of
-        Nothing -> Left (TypeError ctx e UnboundVariable)
-        Just a  -> return a
+    Var v -> ctx v
     Lam x _A b  -> do
-        let ctx' = fmap (shift 1 x) (Context.insert x _A ctx)
-        _B <- typeWith ctx' b
+        -- TODO: Maybe use let _A' = whnf _A instead of _A?
+        --       Depends on whether _A will be reduced anyway
+        --       during checking and quality of error messages
+        _B <- fmap Bound.toScope (typeWith (consContext _A ctx) (Bound.fromScope b))
         let p = Pi x _A _B
         _t <- typeWith ctx p
         return p
-    Pi  x _A _B -> do
-        eS <- fmap whnf (typeWith ctx _A)
-        s  <- case eS of
-            Const s -> return s
-            _       -> Left (TypeError ctx e (InvalidInputType _A))
-        let ctx' = fmap (shift 1 x) (Context.insert x _A ctx)
-        eT <- fmap whnf (typeWith ctx' _B)
-        t  <- case eT of
-            Const t -> return t
-            _       -> Left (TypeError ctx' e (InvalidOutputType _B))
+    Pi  ~(Name x _) _A _B -> do
+        eS <- typeWith ctx _A
+        let errInp = InvalidInputType (fmap build e) (fmap build _A)
+        s  <- (note errInp . asConst . whnf) eS
+        eT <- typeWith (consContext _A ctx) (Bound.fromScope _B)
+        let errOut = InvalidOutputType (fmap build e) (Bound.instantiate1 (pure (build x)) (fmap build _B))
+        t  <- (note errOut . asConst . whnf) eT
         fmap Const (rule s t)
     App f a     -> do
-        e' <- fmap whnf (typeWith ctx f)
-        (x, _A, _B) <- case e' of
-            Pi x _A _B -> return (x, _A, _B)
-            _          -> Left (TypeError ctx e NotAFunction)
-        _A' <- typeWith ctx a
-        if _A == _A'
-            then do
-                let a'  = shift 1 x a
-                    _B' = subst x 0 a' _B
-                return (shift (-1) x _B')
-            else do
-                let nf_A  = normalize _A
-                    nf_A' = normalize _A'
-                Left (TypeError ctx e (TypeMismatch nf_A nf_A'))
-    Embed p     -> absurd p
+        _F       <- typeWith ctx f
+        let err = NotAFunction (fmap build e) (fmap build _F)
+        (_A, _B) <- (note err . asPi . whnf) _F
+        _A'      <- typeWith ctx a
+        let nf_A  = normalize _A
+            nf_A' = normalize _A'
+        if nf_A == nf_A'
+            then return (Bound.instantiate1 a _B)
+            else Left (TypeMismatch (fmap build e) (fmap build nf_A) (fmap build nf_A'))
+
+noFreeVars :: Buildable var => Context var
+noFreeVars x = Left (UnboundVariable (build x))
 
 {-| `typeOf` is the same as `typeWith` with an empty context, meaning that the
     expression must be closed (i.e. no free variables), otherwise type-checking
     will fail.
 -}
-typeOf :: Expr X -> Either TypeError (Expr X)
-typeOf = typeWith Context.empty
+typeOf :: (Eq var, Buildable var) => Expr var -> CheckResult (Type var)
+typeOf = typeWith noFreeVars
 
 -- | Reduce an expression to weak-head normal form
-whnf :: Expr a -> Expr a
+whnf :: Expr var -> Expr var
 whnf e = case e of
     App f a -> case whnf f of
-        Lam x _A b -> whnf (shift (-1) x b')  -- Beta reduce
-          where
-            a' = shift 1 x a
-            b' = subst x 0 a' b
-        _          -> e
+        Lam x _A b -> whnf (Bound.instantiate1 a b)  -- Beta reduce
+        f'         -> App f' a
     _       -> e
 
--- | Returns whether a variable is free in an expression
-freeIn :: Var -> Expr a -> Bool
-freeIn v@(V x n) = go
+-- | Try to unshift the given expression if its argument is unused.
+tryUnshift :: Monad f => Scope b f a -> Maybe (f a)
+tryUnshift = traverse unF . Bound.fromScope
   where
-    go e = case e of
-        Lam x' _A b  ->
-            n' `seq` (go _A || if x == x' then freeIn (V x n')  b else go  b)
-          where
-            n' = n + 1
-        Pi  x' _A _B ->
-            n' `seq` (go _A || if x == x' then freeIn (V x n') _B else go _B)
-          where
-            n' = n + 1
-        Var v'      -> v == v'
-        App f a     -> go f || go a
-        Const _     -> False
-        -- The Morte compiler enforces that all embedded values
-        -- are closed expressions
-        Embed _     -> False
+    unF x = case x of
+        F e -> Just e
+        _ -> Nothing
 
 {-| Reduce an expression to its normal form, performing both beta reduction and
     eta reduction
@@ -617,33 +518,21 @@ freeIn v@(V x n) = go
     expressions before normalizing them since normalization can convert an
     ill-typed expression into a well-typed expression.
 -}
-normalize :: Expr a -> Expr a
+normalize :: Expr var -> Expr var
 normalize e = case e of
-    Lam x _A b -> case b' of
-        App f a -> case a' of
-            Var v' | v == v' && not (v `freeIn` f) ->
-                shift (-1) x f  -- Eta reduce
-                   | otherwise                     ->
-                e'
-              where
-                v = V x 0
-            _                                      -> e'
-          where
-            a' = whnf a
+    Lam x _A (Scope b)  -> case b' of
+        App f (Var (B ())) -> case tryUnshift f of
+            Just f' -> f'
+            _       -> e'
         _       -> e'
       where
         b' = normalize b
-        e' = Lam x (normalize _A) b'
-    Pi  x _A _B -> Pi x (normalize _A) (normalize _B)
-    App f a     -> case normalize f of
-        Lam x _A b -> normalize (shift (-1) x b')  -- Beta reduce
-          where
-            a' = shift 1 x (normalize a)
-            b' = subst x 0 a' b
+        e' = Lam x (normalize _A) (Scope b')
+    Pi  x _A (Scope _B) -> Pi x (normalize _A) (Scope (normalize _B))
+    App f a             -> case normalize f of
+        Lam x _A b -> normalize (Bound.instantiate1 (normalize a) (normalize b))  -- Beta reduce
         f'         -> App f' (normalize a)
-    Var   _    -> e
-    Const _    -> e
-    Embed p    -> Embed p
+    _                   -> e
 
 -- | Pretty-print a value
 pretty :: Buildable a => a -> Text

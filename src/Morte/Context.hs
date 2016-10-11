@@ -1,5 +1,5 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DeriveFunctor              #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 -- | All `Context`-related operations
 
@@ -12,9 +12,11 @@ module Morte.Context (
     , toList
     ) where
 
-import Control.DeepSeq (NFData)
-import Data.Text.Lazy (Text)
-import Prelude hiding (lookup)
+import           Control.DeepSeq (NFData)
+import           Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import           Data.Text.Lazy  (Text)
+import           Prelude         hiding (lookup)
 
 {-| Bound variable names and their types
 
@@ -22,19 +24,19 @@ import Prelude hiding (lookup)
     refers to the @n@th occurrence of @x@ in the `Context` (using 0-based
     numbering).
 -}
-newtype Context a = Context { getContext :: [(Text, a)] }
-    deriving (Functor, NFData)
+newtype Context a = Context { getContext :: Map Text a }
+    deriving (Functor, NFData, Eq, Ord, Show, Read)
 
 {-| An empty context with no key-value pairs
 
 > toList empty = []
 -}
 empty :: Context a
-empty = Context []
+empty = Context Map.empty
 
 -- | Add a key-value pair to the `Context`
 insert :: Text -> a -> Context a -> Context a
-insert k v (Context kvs) = Context ((k, v) : kvs)
+insert k v (Context kvs) = Context (Map.insert k v kvs)
 {-# INLINABLE insert #-}
 
 {-| Lookup a key by name and index
@@ -42,17 +44,11 @@ insert k v (Context kvs) = Context ((k, v) : kvs)
 > lookup k 0 (insert k v0              ctx ) = Just v0
 > lookup k 1 (insert k v0 (insert k v1 ctx)) = Just v1
 -}
-lookup :: Text -> Int -> Context a -> Maybe a
-lookup k n0 (Context kvs0) = loop kvs0 n0
-  where
-    loop ((k', v):kvs) n | k /= k'   = loop kvs    n
-                         | n >  0    = loop kvs $! n - 1
-                         | n == 0    = Just v
-                         | otherwise = Nothing
-    loop  []           _             = Nothing
+lookup :: Text -> Context a -> Maybe a
+lookup k (Context kvs) = Map.lookup k kvs
 {-# INLINABLE lookup #-}
 
 -- | Return all key-value associations as a list
 toList :: Context a -> [(Text, a)]
-toList = getContext
+toList = Map.toList . getContext
 {-# INLINABLE toList #-}

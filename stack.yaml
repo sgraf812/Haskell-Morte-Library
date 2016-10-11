@@ -1,4 +1,11 @@
-resolver: lts-7.2
+flags:
+  deriving-compat:
+    base-4-9: false
+    template-haskell-2-11: false
+    new-functor-classes: false
 extra-deps:
+- deriving-compat-0.3.3
 - http-client-0.5.3.2
 - http-client-tls-0.3.3
+- morte-1.6.4
+resolver: lts-6.20
