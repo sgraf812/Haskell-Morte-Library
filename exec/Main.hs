@@ -4,7 +4,7 @@ import Control.Exception (Exception, throwIO)
 import Data.Monoid
 import Data.Traversable
 import Morte.Core (typeOf, pretty, normalize)
-import Morte.Import (load)
+import Morte.Import (load, asFullyResolved)
 import Morte.Parser (exprFromText)
 import Options.Applicative hiding (Const)
 import System.IO (stderr)
@@ -60,7 +60,7 @@ parser
 
 main :: IO ()
 main = do
-    mode <- execParser $ info (helper <*> parser) 
+    mode <- execParser $ info (helper <*> parser)
         (   fullDesc
         <>  header "morte - A bare-bones calculus of constructions"
         <>  progDesc "Type-check, resolve, and normalize a Morte program, \
@@ -85,7 +85,7 @@ main = do
         TypeCheck -> do
             inText <- Text.getContents
             expr   <- throws (exprFromText inText)
-            case traverse (\_ -> Nothing) expr of
+            case asFullyResolved expr of
                 Nothing    -> throwIO (userError
                     "`morte typecheck` cannot type-check a program containing \
                     \remote references.  Use `morte resolve` to resolve all \

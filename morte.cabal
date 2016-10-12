@@ -55,11 +55,11 @@ Library
         text-format                         < 0.4 ,
         transformers         >= 0.2.0.0  && < 0.6
     Exposed-Modules:
-        Morte.Context,
         Morte.Core,
         Morte.Import,
         Morte.Lexer,
         Morte.Parser,
+        Morte.Path,
         Morte.Tutorial
     Build-Tools: alex
 

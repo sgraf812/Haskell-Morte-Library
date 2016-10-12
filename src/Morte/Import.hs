@@ -46,7 +46,7 @@
 
     ... Morte would throw the following exception if you tried to import @foo@:
 
-    > morte: 
+    > morte:
     > ⤷ ./foo
     > ⤷ ./bar
     > Cyclic import: ./foo
@@ -56,7 +56,7 @@
 
     > http://host[:port]/path
 
-    The compiler expects the downloaded expressions to be in the same format 
+    The compiler expects the downloaded expressions to be in the same format
     as local files, specifically UTF8-encoded source code text.
 
     For example, if our @id@ expression were hosted at @http://example.com/id@,
@@ -71,7 +71,9 @@
 
 module Morte.Import (
     -- * Import
-      load
+      Path (..)
+    , load
+    , asFullyResolved
     , Cycle(..)
     , ReferentiallyOpaque(..)
     , Imported(..)
@@ -86,16 +88,16 @@ import Data.Monoid ((<>))
 import Data.Text.Buildable (build)
 import Data.Text.Lazy (Text)
 import Data.Text.Lazy.Builder (Builder)
-#if MIN_VERSION_base(4,8,0)
-#else
+#if !MIN_VERSION_base(4,8,0)
 import Data.Traversable (traverse)
 #endif
 import Data.Typeable (Typeable)
 import Filesystem.Path ((</>), FilePath)
-import Filesystem as Filesystem
+import Filesystem
 import Lens.Micro (Lens')
 import Lens.Micro.Mtl (zoom)
-import Morte.Core (Expr, Path(..), X(..))
+import Morte.Core (Expr)
+import Morte.Path (Path(..), EmbedPath)
 import Network.HTTP.Client (Manager)
 import Prelude hiding (FilePath)
 
@@ -108,6 +110,7 @@ import qualified Data.Text.Lazy.Builder           as Builder
 import qualified Data.Text.Lazy.Encoding          as Text
 import qualified Morte.Core                       as Morte
 import qualified Morte.Parser                     as Morte
+import qualified Morte.Path                       as Morte
 import qualified Network.HTTP.Client              as HTTP
 import qualified Network.HTTP.Client.TLS          as HTTP
 import qualified Filesystem.Path.CurrentOS        as Filesystem
@@ -181,7 +184,7 @@ instance Show e => Show (Imported e) where
 
 data Status = Status
     { _stack   :: [Path]
-    , _cache   :: Map Path (Expr X)
+    , _cache   :: Map Path (Expr Text)
     , _manager :: Maybe Manager
     }
 
@@ -191,7 +194,7 @@ canonicalizeAll = map canonicalize . List.tails
 stack :: Lens' Status [Path]
 stack k s = fmap (\x -> s { _stack = x }) (k (_stack s))
 
-cache :: Lens' Status (Map Path (Expr X))
+cache :: Lens' Status (Map Path (Expr Text))
 cache k s = fmap (\x -> s { _cache = x }) (k (_cache s))
 
 manager :: Lens' Status (Maybe Manager)
@@ -253,7 +256,7 @@ canonicalize (File file0:paths0) =
                 url' = parentURL (removeAtFromURL url)
             Nothing    -> case Filesystem.stripPrefix "." path of
                 Just path' -> combine url path'
-                Nothing    -> 
+                Nothing    ->
                     -- This `last` is safe because the lexer constrains all
                     -- URLs to be non-empty.  I couldn't find a simple and safe
                     -- equivalent in the `text` API
@@ -300,7 +303,7 @@ clean = strip . Filesystem.collapse
     This also returns the true final path (i.e. explicit "/@" at the end for
     directories)
 -}
-loadDynamic :: Path -> StateT Status IO (Expr Path)
+loadDynamic :: Path -> StateT Status IO (Expr (EmbedPath Text))
 loadDynamic p = do
     paths <- zoom stack State.get
 
@@ -340,7 +343,7 @@ loadDynamic p = do
     txt <- case canonicalize (p:paths) of
         File file -> readFile' file
         URL  url  -> readURL   url
-    
+
     let abort err = liftIO (throwIO (Imported (p:paths) err))
     case Morte.exprFromText txt of
         Left  err  -> case canonicalize (p:paths) of
@@ -361,8 +364,22 @@ loadDynamic p = do
             _       -> liftIO (abort err)
         Right expr -> return expr
 
+resolvePaths :: Expr (EmbedPath Text) -> StateT Status IO (Expr Text)
+resolvePaths = fmap join . traverse unEmbed
+  where
+    unEmbed emb = case emb of
+        Morte.V var  -> return (Morte.Var var)
+        Morte.P path -> loadStatic path
+
+asFullyResolved :: Expr (EmbedPath Text) -> Maybe (Expr Text)
+asFullyResolved = fmap join . traverse filterVars
+  where
+    filterVars emb = case emb of
+        Morte.V var -> Just (Morte.Var var)
+        Morte.P _   -> Nothing
+
 -- | Load a `Path` as a \"static\" expression (with all imports resolved)
-loadStatic :: Path -> StateT Status IO (Expr X)
+loadStatic :: Path -> StateT Status IO (Expr Text)
 loadStatic path = do
     paths <- zoom stack State.get
 
@@ -381,6 +398,7 @@ loadStatic path = do
         then liftIO (throwIO (Imported paths (ReferentiallyOpaque path)))
         else return ()
 
+
     (expr, cached) <- if here `elem` canonicalizeAll paths
         then liftIO (throwIO (Imported paths (Cycle path)))
         else do
@@ -398,7 +416,7 @@ loadStatic path = do
                         Nothing   -> do
                             let paths' = path:paths
                             zoom stack (State.put paths')
-                            expr'' <- fmap join (traverse loadStatic expr')
+                            expr'' <- resolvePaths expr'
                             zoom stack (State.put paths)
                             return expr''
                     return (expr'', False)
@@ -426,10 +444,10 @@ loadStatic path = do
 load
     :: Maybe Path
     -- ^ Starting path
-    -> Expr Path
+    -> Expr (EmbedPath Text)
     -- ^ Expression to resolve
-    -> IO (Expr X)
+    -> IO (Expr Text)
 load here expr =
-    State.evalStateT (fmap join (traverse loadStatic expr)) status
+    State.evalStateT (resolvePaths expr) status
   where
     status = Status (Foldable.toList here) Map.empty Nothing

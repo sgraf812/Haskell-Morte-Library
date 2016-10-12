@@ -11,7 +11,7 @@
 {-# LANGUAGE RankNTypes           #-}
 {-# LANGUAGE TemplateHaskell      #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# OPTIONS_GHC -Wall #-}
+{-# OPTIONS_GHC -Wall -fno-warn-orphans #-}
 
 {-| This module contains the core calculus for the Morte language.  This
     language is a minimalist implementation of the calculus of constructions,
@@ -53,31 +53,28 @@
 
 module Morte.Core (
     -- * Syntax
-    Var(..),
     Const(..),
-    Path(..),
     X(..),
     Expr(..),
+    ClosedExpr,
+    Type,
     Context,
 
     -- * Core functions
     typeWith,
-    typeWith,
+    typeOf,
     normalize,
 
     -- * Utilities
-    shift,
-    subst,
     pretty,
 
     -- * Errors
     TypeError(..),
-    TypeMessage(..),
     ) where
 
 import           Bound                            (Scope (..), Var (..), (>>>=))
 import qualified Bound
-import           Bound.Name                       (Name (..), name)
+import           Bound.Name                       (Name (..))
 #if MIN_VERSION_base(4,8,0)
 #else
 import           Control.Applicative              (Applicative (..), (<$>))
@@ -87,19 +84,13 @@ import           Control.Error.Util               (note)
 import           Control.Exception                (Exception)
 import           Control.Monad                    (ap, join, mzero)
 import           Data.Binary                      (Binary (..), Get, Put)
-import           Data.Coerce
-import           Data.Foldable
-import           Data.Maybe                       (isNothing)
 import           Data.Monoid                      ((<>))
 import           Data.String                      (IsString (..))
 import           Data.Text.Buildable              (Buildable (..))
 import           Data.Text.Lazy                   (Text)
 import           Data.Text.Lazy.Builder           (Builder)
-import           Data.Traversable
 import           Data.Typeable                    (Typeable)
 import           Data.Word                        (Word8)
-import           Filesystem.Path.CurrentOS        (FilePath)
-import           Prelude                          hiding (FilePath)
 #if MIN_VERSION_transformers(0,5,0) || !MIN_VERSION_transformers(0,4,0)
 import           Data.Deriving                    (deriveEq1, deriveOrd1,
                                                    deriveRead1, deriveShow1)
@@ -108,48 +99,15 @@ import           Data.Functor.Classes
 import           Prelude.Extras
 #endif
 
-import qualified Control.Monad.Trans.State.Strict as State
-import qualified Data.Binary.Get                  as Get
-import qualified Data.Binary.Put                  as Put
+#if !MIN_VERSION_base(4,8,0)
+import           Data.Foldable
+import           Data.Traversable
+#endif
+
 import qualified Data.Text.Encoding               as Text
 import qualified Data.Text.Lazy                   as Text
 import qualified Data.Text.Lazy.Builder           as Builder
-import qualified Filesystem.Path.CurrentOS        as Filesystem
 import           GHC.Generics                     (Generic)
-
-{-| Label for a bound variable
-
-    The `Text` field is the variable's name (i.e. \"@x@\").
-
-    The `Int` field disambiguates variables with the same name if there are
-    multiple bound variables of the same name in scope.  Zero refers to the
-    nearest bound variable and the index increases by one for each bound variable
-    of the same name going outward.  The following diagram may help:
-
->                           +-refers to-+
->                           |           |
->                           v           |
-> \(x : *) -> \(y : *) -> \(x : *) -> x@0
->
->   +-------------refers to-------------+
->   |                                   |
->   v                                   |
-> \(x : *) -> \(y : *) -> \(x : *) -> x@1
-
-    This `Int` behaves like a De Bruijn index in the special case where all
-    variables have the same name.
-
-    You can optionally omit the index if it is @0@:
-
->                           +refers to+
->                           |         |
->                           v         |
-> \(x : *) -> \(y : *) -> \(x : *) -> x
-
-    Zero indices are omitted when pretty-printing `Var`s and non-zero indices
-    appear as a numeric suffix.
--}
--- data Var = V Text Int deriving (Eq, Show)
 
 putUtf8 :: Text -> Put
 putUtf8 txt = put (Text.encodeUtf8 (Text.toStrict txt))
@@ -205,24 +163,6 @@ rule Star Box  = return Box
 rule Star Star = return Star
 rule Box  Box  = return Box
 rule Box  Star = return Star
-
--- | Path to an external resource
-data Path
-    = File FilePath
-    | URL  Text
-    deriving (Eq, Ord, Show)
-
-instance Buildable Path where
-    build (File file)
-        |  Text.isPrefixOf  "./" txt
-        || Text.isPrefixOf   "/" txt
-        || Text.isPrefixOf "../" txt
-        = build txt <> " "
-        | otherwise
-        = "./" <> build txt <> " "
-      where
-        txt = Text.fromStrict (either id id (Filesystem.toText file))
-    build (URL  str ) = build str <> " "
 
 {-| Like `Data.Void.Void`, except with an `NFData` instance in order to avoid
     orphan instances
@@ -302,15 +242,15 @@ instance Binary (Expr Text) where
             put c
         Var x       -> do
             put (1 :: Word8)
-            put x
+            putUtf8 x
         Lam (Name x _) _A b  -> do
             put (2 :: Word8)
-            put x
+            putUtf8 x
             put _A
             put (Bound.instantiate1 (pure x) b)
         Pi  (Name x _) _A _B -> do
             put (3 :: Word8)
-            put x
+            putUtf8 x
             put _A
             put (Bound.instantiate1 (pure x) _B)
         App f a     -> do
@@ -324,15 +264,15 @@ instance Binary (Expr Text) where
             0 -> Const <$> get
             1 -> Var <$> get
             2 -> do
-                x <- get
+                x <- getUtf8
                 _A <- get
-                b <- Bound.abstract1 (name x) <$> get
-                return (Lam x _A b)
+                b <- Bound.abstract1 x <$> get
+                return (Lam (Name x ()) _A b)
             3 -> do
                 x <- get
                 _A <- get
-                _B <- Bound.abstract1 (name x) <$> get
-                return (Pi x _A _B)
+                _B <- Bound.abstract1 x <$> get
+                return (Pi (Name x ()) _A _B)
             4 -> App <$> get <*> get
             _ -> fail "get Expr: Invalid tag byte"
 
@@ -378,7 +318,8 @@ instance Buildable var => Buildable (Expr var)
                      else go True False _A )
                 <>  " → "
                 <>  go False False (Bound.instantiate1 (pure (build x)) _B)
-            App f a              -> go True False f <> " " <> go True True a
+            App f a              -> paren parenApp $
+                go True False f <> " " <> go True True a
 
 -- | The specific type error
 data TypeError
@@ -388,9 +329,20 @@ data TypeError
     | NotAFunction (Expr Builder) (Type Builder)
     | TypeMismatch (Expr Builder) (Type Builder) (Type Builder)
     | Untyped Const
-    deriving (Show, Generic)
+    deriving (Show, Generic, Typeable)
 
-instance NFData TypeError
+instance NFData TypeError where
+    -- We need this instance for benchmarking.
+    -- Builder has no NFData instance. Since the construction of the actual
+    -- error messages shouldn't be reflected in benchmark time anyway,
+    -- we just skip forcing the exprs.
+    rnf err = case err of
+        UnboundVariable{} -> ()
+        InvalidInputType{} -> ()
+        InvalidOutputType{} -> ()
+        NotAFunction{} -> ()
+        TypeMismatch{} -> ()
+        Untyped c -> rnf c
 
 instance Buildable TypeError where
     build msg = case msg of
@@ -414,12 +366,12 @@ instance Buildable TypeError where
             <>  "\n"
             <>  buildExpr e
             <>  buildType f
-        TypeMismatch e exp arg    ->
+        TypeMismatch e expected actual ->
                 "Error: Function applied to argument of the wrong type\n"
             <>  "\n"
             <>  buildExpr e
-            <>  "Expected type: " <> build exp <> "\n"
-            <>  "Argument type: " <> build arg <> "\n"
+            <>  "Expected type: " <> build expected <> "\n"
+            <>  "Argument type: " <> build actual <> "\n"
         Untyped c                 ->
                 "Error: " <> build c <> " has no type\n"
       where
@@ -432,10 +384,10 @@ type CheckResult var = Either TypeError var
 
 type Context var = var -> CheckResult (Type var)
 
-consContext :: (Expr var) -> Context var -> Context (Var () var)
+consContext :: Expr var -> Context var -> Context (Var () var)
 consContext v ctx k = case k of
     B () -> pure (F <$> v)
-    F k  -> (F <$>) <$> ctx k
+    F k' -> (F <$>) <$> ctx k'
 
 asConst :: Expr var -> Maybe Const
 asConst e = case e of
@@ -446,6 +398,12 @@ asPi :: Expr var -> Maybe (Type var, Scope () Type var)
 asPi e = case e of
     Pi _ _A _B -> Just (_A, _B)
     _          -> Nothing
+
+instance Buildable var => Buildable (Var () var)
+  where
+    build v = case v of
+        B () -> "B ()"
+        F var -> "F (" <> build var <> ")"
 
 {-| Type-check an expression and return the expression's type if type-checking
     suceeds or an error if type-checking fails
@@ -499,13 +457,13 @@ typeOf = typeWith noFreeVars
 whnf :: Expr var -> Expr var
 whnf e = case e of
     App f a -> case whnf f of
-        Lam x _A b -> whnf (Bound.instantiate1 a b)  -- Beta reduce
+        Lam _ _A b -> whnf (Bound.instantiate1 a b)  -- Beta reduce
         f'         -> App f' a
     _       -> e
 
 -- | Try to unshift the given expression if its argument is unused.
-tryUnshift :: Monad f => Scope b f a -> Maybe (f a)
-tryUnshift = traverse unF . Bound.fromScope
+tryUnshift :: (Traversable f, Monad f) => f (Var b (f a)) -> Maybe (f a)
+tryUnshift = fmap join . traverse unF
   where
     unF x = case x of
         F e -> Just e
@@ -530,7 +488,7 @@ normalize e = case e of
         e' = Lam x (normalize _A) (Scope b')
     Pi  x _A (Scope _B) -> Pi x (normalize _A) (Scope (normalize _B))
     App f a             -> case normalize f of
-        Lam x _A b -> normalize (Bound.instantiate1 (normalize a) (normalize b))  -- Beta reduce
+        Lam _ _A b -> normalize (Bound.instantiate1 (normalize a) b)  -- Beta reduce
         f'         -> App f' (normalize a)
     _                   -> e
 

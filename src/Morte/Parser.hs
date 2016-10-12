@@ -13,6 +13,7 @@ module Morte.Parser (
     ParseMessage(..)
     ) where
 
+import Bound.Name (Name(..))
 import Control.Applicative hiding (Const)
 import Control.Exception (Exception)
 import Control.Monad.Trans.Class  (lift)
@@ -24,12 +25,15 @@ import Data.Text.Lazy (Text)
 import Data.Text.Lazy.Builder (toLazyText)
 import Data.Typeable (Typeable)
 import Filesystem.Path.CurrentOS (FilePath)
-import Morte.Core (Var(..), Const(..), Path(..), Expr(..))
+import Morte.Core (Const(..), Expr(..))
+import Morte.Path (Path(..), EmbedPath)
 import Morte.Lexer (LocatedToken(..), Position(..), Token)
 import Prelude hiding (FilePath)
 import Text.Earley
 
+import qualified Bound
 import qualified Morte.Lexer    as Lexer
+import qualified Morte.Path     as Embed
 import qualified Pipes.Prelude  as Pipes
 import qualified Data.Text.Lazy as Text
 
@@ -70,33 +74,19 @@ url = fmap unsafeFromURL (satisfy isURL)
 
     unsafeFromURL (LocatedToken (Lexer.URL n) _) = n
 
-expr :: Grammar r (Prod r Token LocatedToken (Expr Path))
+expr :: Grammar r (Prod r Token LocatedToken (Expr (EmbedPath Text)))
 expr = mdo
     expr <- rule
         (   bexpr
-        <|> (   Lam
-            <$> (match Lexer.Lambda *> match Lexer.OpenParen *> label)
-            <*> (match Lexer.Colon *> expr)
-            <*> (match Lexer.CloseParen *> match Lexer.Arrow *> expr)
+        <|> (   lambdaOrPi
+            <$> (match Lexer.Lambda <|> match Lexer.Pi)
+            <*> (match Lexer.OpenParen *> label)                         -- x
+            <*> (match Lexer.Colon *> expr)                           -- _A
+            <*> (match Lexer.CloseParen *> match Lexer.Arrow *> expr) -- b
             )
-        <|> (   Pi
-            <$> (match Lexer.Pi *> match Lexer.OpenParen *> label)
-            <*> (match Lexer.Colon *> expr)
-            <*> (match Lexer.CloseParen *> match Lexer.Arrow *> expr)
-            )
-        <|> (   Pi "_"
+        <|> (   lambdaOrPi Lexer.Pi "_"
             <$> bexpr
             <*> (match Lexer.Arrow *> expr)
-            )
-        )
-    vexpr <- rule
-        (   (   V
-            <$> label
-            <*> (match Lexer.At *> number)
-            )
-        <|> (   V
-            <$> label
-            <*> pure 0
             )
         )
     bexpr <- rule
@@ -107,14 +97,14 @@ expr = mdo
         <|> aexpr
         )
     aexpr <- rule
-        (   (   Var
-            <$> vexpr
+        (   (   Var . Embed.V
+            <$> label
             )
         <|> (   match Lexer.Star *> pure (Const Star)
             )
         <|> (   match Lexer.Box  *> pure (Const Box)
             )
-        <|> (   Embed
+        <|> (   Var . Embed.P
             <$> import_
             )
         <|> (   match Lexer.OpenParen *> expr <* match Lexer.CloseParen
@@ -129,6 +119,15 @@ expr = mdo
             <$> url
             )
         )
+    let lambdaOrPi lexeme x _A b = case lexeme of
+            Lexer.Lambda -> Lam (Name x ()) _A b'
+            Lexer.Pi     -> Pi  (Name x ()) _A b'
+            _            -> error "lambdaOrPi was called with neither a lambda nor a pi"
+          where
+            matchVar v = case v of
+                Embed.V x' | x == x' -> Just ()
+                _                    -> Nothing
+            b' = Bound.abstract matchVar b
 
     return expr
 
@@ -172,7 +171,7 @@ instance Buildable ParseError where
                 <>  "Error: Parsing failed\n"
 
 -- | Parse an `Expr` from `Text` or return a `ParseError` if parsing fails
-exprFromText :: Text -> Either ParseError (Expr Path)
+exprFromText :: Text -> Either ParseError (Expr (EmbedPath Text))
 exprFromText text = evalState (runExceptT m) (Lexer.P 1 0)
   where
     m = do
