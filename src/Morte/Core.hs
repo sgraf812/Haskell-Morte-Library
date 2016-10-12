@@ -478,19 +478,25 @@ tryUnshift = fmap join . traverse unF
 -}
 normalize :: Expr var -> Expr var
 normalize e = case e of
-    Lam x _A (Scope b)  -> case b' of
-        App f (Var (B ())) -> case tryUnshift f of
-            Just f' -> f'
-            _       -> e'
-        _       -> e'
+    Lam x _A b  -> case normalizeScope b of
+        b'@(Scope (App f a)) -> case (tryUnshift f, a) of
+            -- This would also be detected by beta reduction, but eta reduction
+            -- is more efficient I gues... One could play all kinds of
+            -- shenanigans with normalization strategies.
+            (Just f', Var (B ())) -> f'
+            _                     -> Lam x _A' b'
+        b'                   -> Lam x _A' b'
       where
-        b' = normalize b
-        e' = Lam x (normalize _A) (Scope b')
-    Pi  x _A (Scope _B) -> Pi x (normalize _A) (Scope (normalize _B))
-    App f a             -> case normalize f of
-        Lam _ _A b -> normalize (Bound.instantiate1 (normalize a) b)  -- Beta reduce
-        f'         -> App f' (normalize a)
-    _                   -> e
+        _A' = normalize _A
+    Pi  x _A _B -> Pi x (normalize _A) (normalizeScope _B)
+    App f a     -> case normalize f of
+        Lam _ _ b -> normalize (Bound.instantiate1 a' b)  -- Beta reduce
+        f'        -> App f' a'
+      where
+        a' = normalize a
+    _           -> e
+  where
+    normalizeScope = Bound.toScope . normalize . Bound.fromScope
 
 -- | Pretty-print a value
 pretty :: Buildable a => a -> Text
