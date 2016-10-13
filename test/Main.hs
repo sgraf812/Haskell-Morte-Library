@@ -14,6 +14,7 @@ import Prelude hiding (FilePath)
 import Test.Tasty (TestTree)
 
 import qualified Data.Text.Lazy.IO         as Text
+import qualified Data.Text.Lazy            as Text
 import qualified Filesystem.Path.CurrentOS as Filesystem
 import qualified Morte.Core                as Morte
 import qualified Morte.Import              as Morte
@@ -81,17 +82,29 @@ example
 example path stderr stdout = do
     str   <- getDataFileName (Filesystem.encodeString path)
     stdin <- Text.readFile str
-    case Morte.exprFromText stdin of
-        Left  e    -> throwIO e
-        Right expr -> do
-            expr' <- Morte.load Nothing expr
-            case Morte.typeOf expr' of
-                Left  e        -> throwIO e
-                Right typeExpr -> do
-                    let stderr' = Morte.pretty (Morte.normalize typeExpr)
-                    let stdout' = Morte.pretty (Morte.normalize expr')
-                    HUnit.assertEqual "" stderr stderr'
-                    HUnit.assertEqual "" stdout stdout'
+    let parseText t = case Morte.exprFromText t of
+            Left e     -> throwIO e
+            Right expr -> Morte.load Nothing expr
+    expr'  <- parseText stdin
+    expVal <- parseText stdout
+    expTy  <- parseText stderr
+    case Morte.typeOf expr' of
+        Left  e        -> throwIO e
+        Right typeExpr -> do
+            let actTy        = Morte.normalize typeExpr
+            let actVal       = Morte.normalize expr'
+            assertEqualPretty "normalized values should match" expVal actVal
+            assertEqualPretty "normalized types should match" expTy actTy
+
+assertEqualPretty :: String -> Expr Text -> Expr Text -> HUnit.Assertion
+assertEqualPretty msg expected actual =
+    HUnit.assertBool completeMsg (expected == actual)
+      where
+        completeMsg = unlines
+            [ msg
+            , "expected: " ++ Text.unpack (Morte.pretty expected)
+            , "but got:  " ++ Text.unpack (Morte.pretty actual)
+            ]
 
 example0 :: IO ()
 example0 =

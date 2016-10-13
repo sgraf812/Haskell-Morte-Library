@@ -109,6 +109,8 @@ import qualified Data.Text.Lazy                   as Text
 import qualified Data.Text.Lazy.Builder           as Builder
 import           GHC.Generics                     (Generic)
 
+import Debug.Trace
+
 putUtf8 :: Text -> Put
 putUtf8 txt = put (Text.encodeUtf8 (Text.toStrict txt))
 
@@ -329,7 +331,7 @@ data TypeError
     | NotAFunction (Expr Builder) (Type Builder)
     | TypeMismatch (Expr Builder) (Type Builder) (Type Builder)
     | Untyped Const
-    deriving (Show, Generic, Typeable)
+    deriving (Generic, Typeable)
 
 instance NFData TypeError where
     -- We need this instance for benchmarking.
@@ -377,6 +379,10 @@ instance Buildable TypeError where
       where
         buildExpr e = "Expression: " <> build e <> "\n"
         buildType ty = "Type: " <> build ty <> "\n"
+
+instance Show TypeError
+  where
+    show = Text.unpack . pretty
 
 instance Exception TypeError
 
@@ -462,8 +468,8 @@ whnf e = case e of
     _       -> e
 
 -- | Try to unshift the given expression if its argument is unused.
-tryUnshift :: (Traversable f, Monad f) => f (Var b (f a)) -> Maybe (f a)
-tryUnshift = fmap join . traverse unF
+tryUnshift' :: (Traversable f) => f (Var b a) -> Maybe (f a)
+tryUnshift' = traverse unF
   where
     unF x = case x of
         F e -> Just e
@@ -478,25 +484,31 @@ tryUnshift = fmap join . traverse unF
 -}
 normalize :: Expr var -> Expr var
 normalize e = case e of
-    Lam x _A b  -> case normalizeScope b of
-        b'@(Scope (App f a)) -> case (tryUnshift f, a) of
+    Lam x _A b -> case normalize (Bound.fromScope b) of
+        App f a -> case (tryUnshift' f, f, a) of
             -- This would also be detected by beta reduction, but eta reduction
-            -- is more efficient I gues... One could play all kinds of
+            -- is more efficient I guess... One could play all kinds of
             -- shenanigans with normalization strategies.
-            (Just f', Var (B ())) -> f'
-            _                     -> Lam x _A' b'
-        b'                   -> Lam x _A' b'
+            (Just f', _, Var (B ())) -> f'
+            (_, Lam _ _ b', _)       ->
+                -- Now that we already did the hard work of normalizing f and a,
+                -- we could just as well beta reduce...
+                normalize (Lam x _A' (Bound.toScope (Bound.instantiate1 a b')))
+            _                        -> Lam x _A' (Bound.toScope (App f a))
+        b'     -> Lam x _A' (Bound.toScope b')
       where
         _A' = normalize _A
     Pi  x _A _B -> Pi x (normalize _A) (normalizeScope _B)
-    App f a     -> case normalize f of
-        Lam _ _ b -> normalize (Bound.instantiate1 a' b)  -- Beta reduce
-        f'        -> App f' a'
-      where
-        a' = normalize a
+    App f a     -> beta (normalize f) (normalize a)
     _           -> e
   where
     normalizeScope = Bound.toScope . normalize . Bound.fromScope
+
+    beta :: forall var . Expr var -> Expr var -> Expr var
+    beta f a = case f of -- assumes f and a are normalized
+        Lam _ _ b -> normalize (Bound.instantiate1 a b)  -- found a redex!
+        _         -> App f a
+
 
 -- | Pretty-print a value
 pretty :: Buildable a => a -> Text
