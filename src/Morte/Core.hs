@@ -483,12 +483,9 @@ tryUnshift' = traverse unF
     ill-typed expression into a well-typed expression.
 -}
 normalize :: Expr var -> Expr var
-normalize e = case e of
+normalize e = case whnf e of
     Lam x _A b -> case normalize (Bound.fromScope b) of
         App f a -> case (tryUnshift' f, f, a) of
-            -- This would also be detected by beta reduction, but eta reduction
-            -- is more efficient I guess... One could play all kinds of
-            -- shenanigans with normalization strategies.
             (Just f', _, Var (B ())) -> f'
             (_, Lam _ _ b', _)       ->
                 -- Now that we already did the hard work of normalizing f and a,
@@ -500,7 +497,7 @@ normalize e = case e of
         _A' = normalize _A
     Pi  x _A _B -> Pi x (normalize _A) (normalizeScope _B)
     App f a     -> beta (normalize f) (normalize a)
-    _           -> e
+    e'          -> e'
   where
     normalizeScope = Bound.toScope . normalize . Bound.fromScope
 
