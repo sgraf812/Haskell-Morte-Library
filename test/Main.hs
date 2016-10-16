@@ -5,7 +5,7 @@ module Main (
   ) where
 
 import Control.Exception (throwIO)
--- import ClosedWellTyped (ClosedWellTyped(..))
+import ClosedWellTyped (ClosedWellTyped(..))
 import Data.Text.Lazy (Text)
 import Filesystem.Path (FilePath)
 import Morte.Core (Expr, X)
@@ -29,13 +29,13 @@ main = Tasty.defaultMain tests
 tests :: TestTree
 tests =
     Tasty.testGroup "Tests"
-        [{- Tasty.testGroup "Properties"
+        [ Tasty.testGroup "Properties"
             [ QuickCheck.testProperty "Normalization is idempotent"
                 normalizationIsIdempotent
             , QuickCheck.testProperty "Normalization preserves type safety"
                 normalizationPreservesTypeSafety
             ]
-        ,-} Tasty.testGroup "Unit tests"
+        , Tasty.testGroup "Unit tests"
             [ HUnit.testCase "Tutorial - Identity"           example0
             , HUnit.testCase "Tutorial - id.mt"              example1
             , HUnit.testCase "Tutorial - id2.mt"             example2
@@ -60,19 +60,16 @@ typeChecks expr = case Morte.typeOf expr of
     Right _ -> True
     Left  _ -> False
 
-{-
 -- Carefully note that `ClosedWellTyped` generates well-typed expressions, so
 -- this is really testing that `typeChecks expr ==> typeChecks (normalize expr)`
 normalizationPreservesTypeSafety :: ClosedWellTyped -> Bool
 normalizationPreservesTypeSafety (ClosedWellTyped expr) =
     typeChecks (Morte.normalize expr)
 
--- Carefully note that `(==)` also normalizes both sides before checking for
--- α-equality, so this is really testing that `normalize (normalize expr)` and
--- `normalize expr` are α-equivalent.
 normalizationIsIdempotent :: ClosedWellTyped -> Bool
-normalizationIsIdempotent (ClosedWellTyped expr) = Morte.normalize expr == expr
--}
+normalizationIsIdempotent (ClosedWellTyped expr) = f (f expr) == f expr
+  where
+    f = Morte.normalize
 
 example
     :: FilePath

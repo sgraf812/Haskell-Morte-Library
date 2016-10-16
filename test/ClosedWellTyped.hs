@@ -1,37 +1,57 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE GADTs #-}
 
 module ClosedWellTyped (
     ClosedWellTyped(..)
     ) where
 
+import Bound (Var(..))
+import Bound.Name (Name(..))
 import Control.Applicative hiding (Const)
+import Control.Arrow ((***))
 import Control.Monad (guard)
 import Data.Text.Lazy (Text)
 import Control.Monad.State.Lazy (MonadState, StateT)
 import Control.Monad.Trans.Class (lift)
-import Morte.Core
+import Morte.Core hiding (Context)
 import Prelude hiding (pi)
 import Test.QuickCheck (Arbitrary, Gen)
 
+import qualified Bound
 import qualified Control.Monad.State.Lazy as State
 import qualified Data.Text.Lazy           as Text
 import qualified Test.QuickCheck          as QuickCheck
 
 newtype ClosedWellTyped = ClosedWellTyped { unClosedWellTyped :: Expr X }
-    deriving Show
 
-data Env = Env
-    { bindings :: [(Var, Expr X)]
-    , uniques  :: [Text]
+instance Show ClosedWellTyped where
+    show (ClosedWellTyped expr) = Text.unpack (pretty expr)
+
+data Context var where
+    Empty :: Context X
+    Extend :: Type var -> Context var -> Context (Var () var)
+
+freeVars :: Context var -> [(var, Type var)]
+freeVars ctx = case ctx of
+    Empty -> []
+    Extend ty ctx' -> (B (), F <$> ty) : map (F *** (F <$>)) (freeVars ctx')
+
+data Env var
+    = Env
+    { bindings :: Context var
+    , uniques :: [Text]
     }
 
-newtype M a = M { unM :: StateT Env Gen a }
-    deriving (Functor, Applicative, Monad, MonadState Env)
+freeVars' :: Env var -> [(var, Type var)]
+freeVars' = freeVars . bindings
 
-liftGen :: Gen a -> M a
+newtype M var a = M { unM :: StateT (Env var) Gen a }
+    deriving (Functor, Applicative, Monad, MonadState (Env var))
+
+liftGen :: Gen a -> M var a
 liftGen m = M (lift m)
 
-evalM :: M a -> Env -> Gen a
+evalM :: M var a -> Env var -> Gen a
 evalM m = State.evalStateT (unM m)
 
 instance Arbitrary ClosedWellTyped
@@ -41,16 +61,17 @@ instance Arbitrary ClosedWellTyped
 rndExpr :: Int -> Gen ClosedWellTyped
 rndExpr n = fmap (ClosedWellTyped . fst) (evalM closed (initEnv n))
 
-initEnv :: Int -> Env
-initEnv n = Env
-    { bindings = []
-    , uniques  = map (Text.pack . show) [1..n]
-    }
+initEnv :: Int -> Env X
+initEnv n = Env Empty (map (Text.pack . show) [1..n])
 
-extend :: Var -> Expr X -> M ()
-extend x t = State.modify (\env -> env { bindings = (x, t) : bindings env })
+withExtend :: Type var -> M (Var () var) a -> M var a
+withExtend ty m = do
+  env <- State.get
+  liftGen (evalM m (env { bindings = Extend ty (bindings env) }))
 
-select :: [(Int, M (Expr X, Expr X), Env -> Bool)] -> M (Expr X, Expr X)
+select
+  :: [(Int, M var (Expr var, Expr var), Env var -> Bool)]
+  -> M var (Expr var, Expr var)
 select wgps = do
     env <- State.get
     m   <- liftGen (QuickCheck.frequency (do
@@ -59,22 +80,22 @@ select wgps = do
         return (weight, return generator) ))
     m
 
-scope :: M a -> M a
+scope :: M var a -> M var a
 scope f = do
     env <- State.get
     liftGen (evalM f env)
 
-matching :: Eq b => b -> [(a, b)] -> Bool
-matching t = any ((t ==) . snd)
+matching :: (b -> Bool)-> [(a, b)] -> Bool
+matching matcher = any (matcher . snd)
 
 moreThan :: Int -> [a] -> Bool
 moreThan n = not . null . drop n
 
-piFilter :: Expr X -> Expr X -> Bool
+piFilter :: Eq var => Expr var -> Expr var -> Bool
 piFilter t (Pi _ _A _) = _A == t
 piFilter _  _          = False
 
-closed :: M (Expr X, Expr X)
+closed :: M X (Expr X, Expr X)
 closed =
     select
         [ (20, typeOrKind                       , \_ -> True          )
@@ -82,78 +103,79 @@ closed =
         , (30, app                              , moreThan 1 . uniques)
         ]
 
-termOrType :: M (Expr X, Expr X)
+termOrType :: Eq var => M var (Expr var, Expr var)
 termOrType =
     select
         [ ( 5, type_                            , moreThan 0 . uniques )
         , (50, lam (scope typeOrKind) termOrType, moreThan 0 . uniques )
-        , (25, var                              , moreThan 0 . bindings)
+        , (25, var                              , moreThan 0 . freeVars')
         , (20, app                              ,
-            \e  ->  (null       (bindings e) && moreThan 1 (uniques e))
-                ||  (moreThan 0 (bindings e) && moreThan 0 (uniques e)) )
+            \e  ->  (null       (freeVars' e) && moreThan 1 (uniques e))
+                ||  (moreThan 0 (freeVars' e) && moreThan 0 (uniques e)))
         ]
 
-typeOrKind :: M (Expr X, Expr X)
+typeOrKind :: Eq var => M var (Expr var, Expr var)
 typeOrKind =
     select
-        [ (15, return (Const Star,Const Box)   , \_ -> True                      )
-        , (20, varWith (== Const Star)         , matching (Const Star) . bindings)
-        , (15, pi (scope typeOrKind) typeOrKind, moreThan 0            . uniques )
+        [ (15, return (Const Star,Const Box)   , \_ -> True                         )
+        , (20, varWith (== Const Star)         , matching (== Const Star) . freeVars')
+        , (15, pi (scope typeOrKind) typeOrKind, moreThan 0               . uniques )
         ]
 
-varWith :: (Expr X -> Bool) -> M (Expr X, Expr X)
+varWith :: (Expr var -> Bool) -> M var (Expr var, Expr var)
 varWith f = do
-    bEnv <- State.gets bindings
+    env <- State.get
     liftGen (QuickCheck.elements (do
-        (x, y) <- bEnv
+        (x, y) <- freeVars (bindings env)
         guard (f y)
         return (Var x, y) ))
 
-var :: M (Expr X, Expr X)
+var :: M var (Expr var, Expr var)
 var = varWith (\_ -> True)
 
-type_ :: M (Expr X, Expr X)
+type_ :: Eq var => M var (Expr var, Expr var)
 type_ =
     select
-        [ (20, varWith (== Const Star)     , matching (Const Star) . bindings)
-        , (15, pi (scope typeOrKind) type_ , moreThan 0            . uniques )
+        [ (20, varWith (== Const Star)     , matching (== Const Star) . freeVars')
+        , (15, pi (scope typeOrKind) type_ , moreThan 0               . uniques  )
         ]
 
-fresh :: M Text
+fresh :: M var Text
 fresh = do
-    env <- State.get
-    let x:xs = uniques env
-    State.put (env { uniques = xs })
+    Env ctx (x:xs) <- State.get
+    State.put (Env ctx xs)
     return x
 
-lam :: M (Expr X, Expr X)
-    -> M (Expr X, Expr X)
-    -> M (Expr X, Expr X)
+lam :: Eq var
+    => M var (Expr var, Expr var)
+    -> M (Var () var) (Expr (Var () var), Expr (Var () var))
+    -> M var (Expr var, Expr var)
 lam _AGen bGen = do
     x <- fresh
     (_A, _) <- _AGen
-    extend (V x 0) _A
-    (b, bType) <- bGen
-    return (Lam x _A b, Pi x _A bType)
+    withExtend _A (do
+        (b, bType) <- bGen
+        return (Lam (Name x ()) _A (Bound.toScope b), Pi (Name x ()) _A (Bound.toScope bType)))
 
-pi  :: M (Expr X, Expr X)
-    -> M (Expr X, Expr X)
-    -> M (Expr X, Expr X)
+pi  :: Eq var
+    => M var (Expr var, Expr var)
+    -> M (Var () var) (Expr (Var () var), Expr (Var () var))
+    -> M var (Expr var, Expr var)
 pi _AGen _BGen = do
     x <- fresh
     (_A, _) <- _AGen
-    extend (V x 0) _A
-    (_B, _BType) <- _BGen
-    return (Pi x _A _B, _BType)
+    withExtend _A (do
+        (_B, Const t) <- _BGen
+        return (Pi (Name x ()) _A (Bound.toScope _B), Const t))
 
-app :: M (Expr X, Expr X)
+app :: Eq var => M var (Expr var, Expr var)
 app = do
     (_N, _A       ) <- scope termOrType
     let genA = return (_A, Const Star)
-    (f , Pi x _ _B) <- do
+    (f , Pi _ _ _B) <- do
         scope
             (select
-                [ (40, lam genA termOrType  , moreThan 0              . uniques )
-                , (20, varWith (piFilter _A), any (piFilter _A . snd) . bindings)
+                [ (40, lam genA termOrType  , moreThan 0             . uniques  )
+                , (20, varWith (piFilter _A), matching (piFilter _A) . freeVars')
                 ] )
-    return (App f _N, subst x 0 _N _B)
+    return (App f _N, Bound.instantiate1 _N _B)
