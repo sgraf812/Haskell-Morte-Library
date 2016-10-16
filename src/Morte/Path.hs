@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings  #-}
+{-# LANGUAGE DeriveFunctor #-}
 
 module Morte.Path (
       Path(..)
@@ -35,7 +36,7 @@ instance Buildable Path where
 data EmbedPath var
     = P Path
     | V var
-    deriving (Eq, Ord, Show)
+    deriving (Eq, Ord, Show, Functor)
 
 instance Buildable var => Buildable (EmbedPath var) where
     build (P path) = build path

@@ -82,7 +82,7 @@ import           Control.Applicative              (Applicative (..), (<$>))
 import           Control.DeepSeq                  (NFData (..))
 import           Control.Error.Util               (note)
 import           Control.Exception                (Exception)
-import           Control.Monad                    (ap, join, mzero)
+import           Control.Monad                    (ap, mzero)
 import           Data.Binary                      (Binary (..), Get, Put)
 import           Data.Monoid                      ((<>))
 import           Data.String                      (IsString (..))
@@ -108,8 +108,6 @@ import qualified Data.Text.Encoding               as Text
 import qualified Data.Text.Lazy                   as Text
 import qualified Data.Text.Lazy.Builder           as Builder
 import           GHC.Generics                     (Generic)
-
-import Debug.Trace
 
 putUtf8 :: Text -> Put
 putUtf8 txt = put (Text.encodeUtf8 (Text.toStrict txt))
@@ -468,8 +466,8 @@ whnf e = case e of
     _       -> e
 
 -- | Try to unshift the given expression if its argument is unused.
-tryUnshift' :: (Traversable f) => f (Var b a) -> Maybe (f a)
-tryUnshift' = traverse unF
+tryUnshift :: (Traversable f) => f (Var b a) -> Maybe (f a)
+tryUnshift = traverse unF
   where
     unF x = case x of
         F e -> Just e
@@ -485,7 +483,7 @@ tryUnshift' = traverse unF
 normalize :: Expr var -> Expr var
 normalize e = case whnf e of
     Lam x _A b -> case normalize (Bound.fromScope b) of
-        App f a -> case (tryUnshift' f, f, a) of
+        App f a -> case (tryUnshift f, f, a) of
             (Just f', _, Var (B ())) -> f'
             (_, Lam _ _ b', _)       ->
                 -- Now that we already did the hard work of normalizing f and a,

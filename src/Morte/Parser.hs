@@ -13,6 +13,7 @@ module Morte.Parser (
     ParseMessage(..)
     ) where
 
+import Bound (Scope(..), Var(..))
 import Bound.Name (Name(..))
 import Control.Applicative hiding (Const)
 import Control.Exception (Exception)
@@ -74,13 +75,32 @@ url = fmap unsafeFromURL (satisfy isURL)
 
     unsafeFromURL (LocatedToken (Lexer.URL n) _) = n
 
+data ShiftedVar var
+    = ShiftedVar var Int
+
+instance Buildable var => Buildable (ShiftedVar var)
+  where
+    build (ShiftedVar v n) = build v <> "@" <> build n
+
+abstractShifted :: (Eq a, Monad f) => a -> f (EmbedPath (ShiftedVar a)) -> Scope () f (EmbedPath (ShiftedVar a))
+abstractShifted x e = Scope (fmap k e)
+  where
+    k v = case v of
+        Embed.V (ShiftedVar y n)
+            | x == y && n == 0 -> B ()
+            | x == y -> F (pure (Embed.V (ShiftedVar y (n-1))))
+        _ -> F (pure v)
+
+forgetShift :: ShiftedVar var -> var
+forgetShift (ShiftedVar v _) = v
+
 expr :: Grammar r (Prod r Token LocatedToken (Expr (EmbedPath Text)))
 expr = mdo
     expr <- rule
         (   bexpr
         <|> (   lambdaOrPi
             <$> (match Lexer.Lambda <|> match Lexer.Pi)
-            <*> (match Lexer.OpenParen *> label)                         -- x
+            <*> (match Lexer.OpenParen *> label)                      -- x
             <*> (match Lexer.Colon *> expr)                           -- _A
             <*> (match Lexer.CloseParen *> match Lexer.Arrow *> expr) -- b
             )
@@ -98,7 +118,7 @@ expr = mdo
         )
     aexpr <- rule
         (   (   Var . Embed.V
-            <$> label
+            <$> vexpr
             )
         <|> (   match Lexer.Star *> pure (Const Star)
             )
@@ -110,7 +130,16 @@ expr = mdo
         <|> (   match Lexer.OpenParen *> expr <* match Lexer.CloseParen
             )
         )
-
+    vexpr <- rule
+        (   (   ShiftedVar
+            <$> label
+            <*> (match Lexer.At *> number)
+            )
+        <|> (   ShiftedVar
+            <$> label
+            <*> pure 0
+            )
+        )
     import_ <- rule
         (   (   File
             <$> file
@@ -127,9 +156,9 @@ expr = mdo
             matchVar v = case v of
                 Embed.V x' | x == x' -> Just ()
                 _                    -> Nothing
-            b' = Bound.abstract matchVar b
+            b' = abstractShifted x b
 
-    return expr
+    return (fmap (fmap (fmap forgetShift)) expr)
 
 -- | The specific parsing error
 data ParseMessage
